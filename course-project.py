@@ -13,6 +13,7 @@
 
 # it directlys loads the data from kaggle
 
+
 import pandas as pd
 import nltk
 import string
@@ -55,7 +56,6 @@ class PakistanLegalIR:
         """Check if text is a table of contents"""
         text_lower = text.lower()
         
-        # Check for TOC patterns
         toc_patterns = [
             r'^\s*contents\s*$',
             r'^\s*table\s+of\s+contents\s*$',
@@ -67,7 +67,6 @@ class PakistanLegalIR:
             if re.search(pattern, text_lower, re.MULTILINE):
                 return True
         
-        # Check if mostly numbered lists
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         if len(lines) < 5:
             return False
@@ -77,13 +76,11 @@ class PakistanLegalIR:
         if numbered_lines / len(lines) > 0.5:
             return True
         
-        # Check for common TOC keywords
         toc_keywords = ['short title', 'definitions', 'extent and commencement', 
                        'punishment', 'cognizance', 'application of', 'power to make',
                        'sale and repair', 'unlicensed', 'power to prohibit']
         keyword_count = sum(1 for keyword in toc_keywords if keyword in text_lower)
         
-        # Stricter TOC detection
         if keyword_count >= 3 and len(text.split()) < 500:
             if 'chapter' in text_lower or 'preliminary' in text_lower:
                 return True
@@ -107,7 +104,6 @@ class PakistanLegalIR:
                 print("ERROR: No files found")
                 return False
             
-            # Try all files, not just the first one
             loaded = False
             for file_path in all_files:
                 ext = os.path.splitext(file_path)[1].lower()
@@ -168,7 +164,7 @@ class PakistanLegalIR:
                     if text and len(text.strip()) > 50 and not self.is_table_of_contents(text):
                         self.documents.append(text)
                         
-                        meta = {'doc_id': idx}
+                        meta = {'doc_id': len(self.documents) - 1}
                         meta_fields = ['title', 'filename', 'file_name', 'name', 
                                      'category', 'law_name', 'act_name']
                         for field in meta_fields:
@@ -194,11 +190,14 @@ class PakistanLegalIR:
                 docs = [doc.strip() for doc in content.split('\n') 
                        if len(doc.strip()) > 100 and not self.is_table_of_contents(doc)]
             
-            self.documents = docs
-            self.doc_metadata = [{'doc_id': i, 'source': os.path.basename(file_path)} 
-                               for i in range(len(docs))]
+            self.documents.extend(docs)
+            for i in range(len(docs)):
+                self.doc_metadata.append({
+                    'doc_id': len(self.documents) - len(docs) + i,
+                    'source': os.path.basename(file_path)
+                })
             
-            return len(self.documents) > 0
+            return len(docs) > 0
             
         except Exception:
             return False
@@ -222,26 +221,24 @@ class PakistanLegalIR:
         if text_col is None:
             return False
         
-        # Store starting index for metadata
-        start_idx = len(self.documents)
-        
         metadata_cols = ['title', 'category', 'law_name', 'act_name', 'section', 
                         'filename', 'file_name']
         
-        # Append documents instead of replacing
+        start_idx = len(self.documents)
+        
         for idx, row in df.iterrows():
             doc_text = str(row[text_col])
             
             if len(doc_text.strip()) > 50 and not self.is_table_of_contents(doc_text):
                 self.documents.append(doc_text)
                 
-                meta = {'doc_id': start_idx + len(self.documents) - 1}
+                meta = {'doc_id': len(self.documents) - 1}
                 for col in metadata_cols:
                     if col in df.columns:
                         meta[col] = str(row[col])
                 self.doc_metadata.append(meta)
         
-        return len(self.documents) > 0
+        return len(self.documents) > start_idx
     
     def preprocess_text(self, text):
         """Advanced preprocessing for legal text"""
@@ -313,7 +310,6 @@ class PakistanLegalIR:
         """Extract page number and line information from document"""
         lines = doc_text.split('\n')
         
-        # Try to find page number
         page_num = None
         for i, line in enumerate(lines[:10]):
             page_match = re.search(r'page\s+(\d+)\s+of\s+(\d+)', line, re.IGNORECASE)
@@ -321,7 +317,6 @@ class PakistanLegalIR:
                 page_num = f"Page {page_match.group(1)} of {page_match.group(2)}"
                 break
         
-        # Count total lines
         total_lines = len([l for l in lines if l.strip()])
         
         return page_num, total_lines
@@ -336,7 +331,6 @@ class PakistanLegalIR:
             if not line:
                 continue
             
-            # Skip TOC-like lines
             if re.match(r'^\d+\.\s+[A-Z]', line):
                 continue
             if re.match(r'^chapter\s+[ivxlcdm]+', line, re.IGNORECASE):
@@ -403,13 +397,149 @@ class PakistanLegalIR:
                     'page_info': page_info,
                     'total_lines': total_lines,
                     'snippet': clean_preview,
-                    'metadata': self.doc_metadata[idx]
+                    'metadata': self.doc_metadata[idx] if idx < len(self.doc_metadata) else {'doc_id': idx}
                 })
         
         return results
     
+    def calculate_precision_at_k(self, results, k, relevant_threshold=0.05):
+        """Calculate Precision@K - ratio of relevant docs in top-k"""
+        if not results or k <= 0:
+            return 0.0
+        
+        top_k = results[:min(k, len(results))]
+        relevant = sum(1 for r in top_k if r['score'] >= relevant_threshold)
+        return relevant / k
+    
+    def calculate_recall_at_k(self, results, k, relevant_threshold=0.05):
+        """Calculate Recall@K - ratio of relevant docs found in top-k"""
+        if not results:
+            return 0.0
+        
+        total_relevant = sum(1 for r in results if r['score'] >= relevant_threshold)
+        if total_relevant == 0:
+            return 0.0
+        
+        top_k = results[:min(k, len(results))]
+        relevant_in_k = sum(1 for r in top_k if r['score'] >= relevant_threshold)
+        return relevant_in_k / total_relevant
+    
+    def calculate_f1_score(self, precision, recall):
+        """Calculate F1 Score - harmonic mean of precision and recall"""
+        if precision + recall == 0:
+            return 0.0
+        return 2 * (precision * recall) / (precision + recall)
+    
+    def calculate_average_precision(self, results, relevant_threshold=0.05):
+        """Calculate Average Precision (AP)"""
+        if not results:
+            return 0.0
+        
+        relevant_count = 0
+        precision_sum = 0.0
+        
+        for i, result in enumerate(results, 1):
+            if result['score'] >= relevant_threshold:
+                relevant_count += 1
+                precision_at_i = relevant_count / i
+                precision_sum += precision_at_i
+        
+        if relevant_count == 0:
+            return 0.0
+        
+        return precision_sum / relevant_count
+    
+    def calculate_dcg_at_k(self, results, k):
+        """Calculate Discounted Cumulative Gain at K"""
+        dcg = 0.0
+        for i, result in enumerate(results[:k], 1):
+            relevance = result['score']
+            dcg += relevance / np.log2(i + 1)
+        return dcg
+    
+    def calculate_ndcg_at_k(self, results, k):
+        """Calculate Normalized DCG at K"""
+        if not results:
+            return 0.0
+        
+        dcg = self.calculate_dcg_at_k(results, k)
+        
+        ideal_results = sorted(results, key=lambda x: x['score'], reverse=True)
+        idcg = self.calculate_dcg_at_k(ideal_results, k)
+        
+        if idcg == 0:
+            return 0.0
+        
+        return dcg / idcg
+    
+    def calculate_mrr(self, results, relevant_threshold=0.05):
+        """Calculate Mean Reciprocal Rank"""
+        for i, result in enumerate(results, 1):
+            if result['score'] >= relevant_threshold:
+                return 1.0 / i
+        return 0.0
+    
+    def evaluate_search(self, results, k_values=[1, 3, 5]):
+        """Calculate all evaluation metrics"""
+        if not results:
+            return None
+        
+        metrics = {
+            'total_results': len(results),
+            'avg_score': np.mean([r['score'] for r in results]),
+        }
+        
+        for k in k_values:
+            if k <= len(results):
+                metrics[f'precision@{k}'] = self.calculate_precision_at_k(results, k)
+                metrics[f'recall@{k}'] = self.calculate_recall_at_k(results, k)
+                metrics[f'ndcg@{k}'] = self.calculate_ndcg_at_k(results, k)
+                
+                p = metrics[f'precision@{k}']
+                r = metrics[f'recall@{k}']
+                metrics[f'f1@{k}'] = self.calculate_f1_score(p, r)
+        
+        metrics['map'] = self.calculate_average_precision(results)
+        metrics['mrr'] = self.calculate_mrr(results)
+        
+        return metrics
+    
+    def display_metrics(self, metrics):
+        """Display evaluation metrics in professional format"""
+        if not metrics:
+            return
+        
+        print("\n" + "="*80)
+        print("EVALUATION METRICS")
+        print("="*80)
+        
+        print(f"\n Overall Statistics:")
+        print(f"   • Total Results: {metrics['total_results']}")
+        print(f"   • Average TF-IDF Score: {metrics['avg_score']:.4f} ({metrics['avg_score']*100:.2f}%)")
+        
+        print(f"\n Ranking Quality Metrics:")
+        if 'map' in metrics:
+            print(f"   • MAP (Mean Average Precision): {metrics['map']:.4f}")
+        if 'mrr' in metrics:
+            print(f"   • MRR (Mean Reciprocal Rank): {metrics['mrr']:.4f}")
+        
+        k_values = [int(k.split('@')[1]) for k in metrics.keys() if 'precision@' in k]
+        
+        for k in sorted(k_values):
+            print(f"\n Metrics @ Top-{k}:")
+            if f'precision@{k}' in metrics:
+                print(f"   • Precision@{k}: {metrics[f'precision@{k}']:.4f} ({metrics[f'precision@{k}']*100:.1f}%)")
+            if f'recall@{k}' in metrics:
+                print(f"   • Recall@{k}: {metrics[f'recall@{k}']:.4f} ({metrics[f'recall@{k}']*100:.1f}%)")
+            if f'f1@{k}' in metrics:
+                print(f"   • F1-Score@{k}: {metrics[f'f1@{k}']:.4f} ({metrics[f'f1@{k}']*100:.1f}%)")
+            if f'ndcg@{k}' in metrics:
+                print(f"   • nDCG@{k}: {metrics[f'ndcg@{k}']:.4f} ({metrics[f'ndcg@{k}']*100:.1f}%)")
+        
+        print("\n" + "="*80)
+    
     def display_results(self, query, results):
-        """Display results in compact format"""
+        """Display results in compact format with metrics"""
         print("\n" + "="*80)
         print(f"QUERY: {query}")
         print("="*80)
@@ -422,7 +552,6 @@ class PakistanLegalIR:
         
         print(f"\nRESULT: Found in {len(results)} document(s) out of {len(self.documents)} total")
         
-        # Show files
         files = set()
         for r in results:
             fname = r['metadata'].get('filename', r['metadata'].get('file_name', 
@@ -435,7 +564,14 @@ class PakistanLegalIR:
         if len(files) > 5:
             print(f"  ... and {len(files)-5} more files")
         
+        # Calculate and display metrics
+        metrics = self.evaluate_search(results)
+        if metrics:
+            self.display_metrics(metrics)
+        
         print("\n" + "="*80)
+        print("SEARCH RESULTS")
+        print("="*80)
         
         for r in results:
             fname = r['metadata'].get('filename', r['metadata'].get('file_name', 
@@ -453,7 +589,6 @@ class PakistanLegalIR:
             
             print(f"Source File: {fname}")
             
-            # Show page and line info
             if r['page_info']:
                 print(f"Location: {r['page_info']}, Total Lines: {r['total_lines']}")
             else:
@@ -479,16 +614,14 @@ def main():
     print(f"SUCCESS: Loaded {len(ir_system.documents)} documents")
     ir_system.build_index()
     
-    # Single example query
     print("\n" + "="*80)
     print("EXAMPLE SEARCH")
     print("="*80)
     
     query = "What are the rights of accused in criminal proceedings"
-    results = ir_system.search(query, top_k=3)
+    results = ir_system.search(query, top_k=5)
     ir_system.display_results(query, results)
     
-    # Interactive mode
     print("="*80)
     print("INTERACTIVE MODE (type 'quit' to exit)")
     print("="*80 + "\n")
@@ -508,4 +641,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
